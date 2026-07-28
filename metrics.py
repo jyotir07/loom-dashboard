@@ -163,9 +163,14 @@ def provider_health(
 ) -> list[dict[str, Any]]:
     """Per-provider latency, success rate, and a status of ok / warn / down.
 
-    Cache hits are excluded from the latency figure: they never touch the
-    provider, so folding their ~0ms into the average measures our cache, not
-    their service.
+    Cache hits and dedup waits are excluded from the latency figure: they never
+    touch the provider, so folding their ~0ms into the average measures our
+    cache, not their service.
+
+    A provider whose only calls in the window were cached therefore has no
+    latency measurement at all. That reports as None, not 0.0 — "we didn't call
+    them" and "they answered instantly" are different facts, and a health panel
+    that renders the first as `0ms ok` is lying.
     """
     where, params = _window(window_seconds)
     rows = sink.fetch(
@@ -173,8 +178,10 @@ def provider_health(
             SELECT
                 provider,
                 COUNT(*) AS calls,
-                COALESCE(AVG(CASE WHEN cached = 0 AND deduped = 0
-                                  THEN latency_ms END), 0.0) AS avg_latency_ms,
+                AVG(CASE WHEN cached = 0 AND deduped = 0
+                         THEN latency_ms END) AS avg_latency_ms,
+                SUM(CASE WHEN cached = 0 AND deduped = 0
+                         THEN 1 ELSE 0 END) AS upstream_calls,
                 SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS ok_calls
             FROM loom_events
             WHERE {where}
@@ -187,27 +194,33 @@ def provider_health(
     for r in rows:
         calls = int(r["calls"] or 0)
         ok_calls = int(r["ok_calls"] or 0)
+        latency = r["avg_latency_ms"]
         out.append({
             "provider": r["provider"],
             "calls": calls,
-            "avg_latency_ms": round(float(r["avg_latency_ms"] or 0.0), 2),
+            "upstream_calls": int(r["upstream_calls"] or 0),
+            "avg_latency_ms": round(float(latency), 2) if latency is not None else None,
             "ok_pct": round(100.0 * ok_calls / calls, 2) if calls else 0.0,
         })
 
-    latencies = sorted(r["avg_latency_ms"] for r in out if r["avg_latency_ms"] > 0)
+    latencies = sorted(
+        r["avg_latency_ms"] for r in out if r["avg_latency_ms"] is not None
+    )
     median = latencies[len(latencies) // 2] if latencies else 0.0
 
     for r in out:
+        latency = r["avg_latency_ms"]
         if r["ok_pct"] == 0.0:
             r["status"] = "down"
         elif r["ok_pct"] < OK_PCT_HEALTHY:
             r["status"] = "warn"
-        elif median and r["avg_latency_ms"] > median * LATENCY_WARN_RATIO:
+        elif median and latency is not None and latency > median * LATENCY_WARN_RATIO:
             r["status"] = "warn"
         else:
             r["status"] = "ok"
 
-    out.sort(key=lambda r: r["avg_latency_ms"])
+    # Unmeasured providers sort last rather than leading as if they were fastest.
+    out.sort(key=lambda r: (r["avg_latency_ms"] is None, r["avg_latency_ms"] or 0.0))
     return out
 
 

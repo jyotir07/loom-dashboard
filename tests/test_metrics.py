@@ -195,6 +195,28 @@ def test_provider_health_excludes_cached_from_latency(sink):
     row = metrics.provider_health(sink)[0]
     assert row["avg_latency_ms"] == 500.0
     assert row["calls"] == 52
+    assert row["upstream_calls"] == 2
+
+
+def test_provider_health_reports_no_latency_when_only_cached(sink):
+    # Never called upstream in this window, so there is nothing to measure.
+    # 0.0 would read as "answered instantly", which is a different claim.
+    for _ in range(5):
+        write(sink, provider="openai", latency_ms=0.3, cached=True)
+
+    row = metrics.provider_health(sink)[0]
+    assert row["avg_latency_ms"] is None
+    assert row["upstream_calls"] == 0
+    assert row["status"] == "ok"
+
+
+def test_provider_health_sorts_unmeasured_providers_last(sink):
+    write(sink, provider="measured", latency_ms=900.0, cached=False)
+    write(sink, provider="cached-only", latency_ms=0.2, cached=True)
+
+    assert [r["provider"] for r in metrics.provider_health(sink)] == [
+        "measured", "cached-only"
+    ]
 
 
 def test_provider_health_single_provider_is_ok(sink):
