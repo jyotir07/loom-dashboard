@@ -1,0 +1,8 @@
+# Loom, pinned to the wheel built from the sibling repo rather than an editable
+# install — the dashboard runs against a fixed build, not whatever is in the
+# working tree. Swap for a PyPI pin or `pip install -e ../Loom` for the opposite.
+../Loom/dist/loom_router-2.0.0-py3-none-any.whl
+
+Flask>=3.0
+python-dotenv>=1.0
+pytest>=8.0

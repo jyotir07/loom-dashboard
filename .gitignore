@@ -1,1 +1,11 @@
 obser_db.md
+plan.md
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+.env
+*.db
+*.db-journal
