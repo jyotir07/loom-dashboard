@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loom · observability</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <h1>loom<span class="dim">/observability</span></h1>
+  </div>
+
+  <!-- One filter row above everything it scopes: every panel re-renders
+       against the same slice. -->
+  <div class="controls">
+    <div class="window-picker" role="group" aria-label="Time window">
+      {% for w in windows %}
+      <button type="button" class="win" data-window="{{ w }}"
+              aria-pressed="{{ 'true' if w == '1h' else 'false' }}">{{ w }}</button>
+      {% endfor %}
+    </div>
+    <button type="button" class="demo-toggle" id="demo-toggle" aria-pressed="false">
+      <span class="dot" aria-hidden="true"></span><span id="demo-label">demo off</span>
+    </button>
+    <span class="status-line" id="poll-status" aria-live="polite">connecting…</span>
+  </div>
+</header>
+
+<main class="grid">
+
+  <section class="cards" aria-label="Key metrics">
+    <div class="card">
+      <span class="card-label">requests / min</span>
+      <span class="card-value" id="card-rpm">—</span>
+      <span class="card-note">trailing 60s</span>
+    </div>
+    <div class="card">
+      <span class="card-label">p95 latency</span>
+      <span class="card-value" id="card-p95">—</span>
+      <span class="card-note">nearest-rank, in window</span>
+    </div>
+    <div class="card">
+      <span class="card-label">cache hit rate</span>
+      <span class="card-value" id="card-cache">—</span>
+      <span class="card-note" id="card-cache-note">cached + deduped</span>
+    </div>
+    <div class="card">
+      <span class="card-label">
+        cost saved
+        <abbr class="est" id="cost-basis" title="Estimate — see method">est</abbr>
+      </span>
+      <span class="card-value" id="card-saved">—</span>
+      <span class="card-note" id="card-saved-note">avoided spend</span>
+    </div>
+  </section>
+
+  <section class="panel panel-chart" aria-label="Requests over time">
+    <div class="panel-head">
+      <h2>requests over time</h2>
+      <span class="panel-meta" id="chart-meta"></span>
+    </div>
+    <!-- Container grows with content so the x-axis band is never clipped
+         into a nested scrollbar. -->
+    <div class="chart-wrap" id="chart-wrap">
+      <svg id="chart" role="img" aria-label="Request throughput over the selected window"></svg>
+      <div class="tooltip" id="chart-tip" hidden></div>
+    </div>
+  </section>
+
+  <section class="panel panel-health" aria-label="Provider health">
+    <div class="panel-head">
+      <h2>provider health</h2>
+      <span class="panel-meta">upstream only</span>
+    </div>
+    <ul class="health-list" id="health-list"></ul>
+    <p class="empty" id="health-empty">no traffic in this window</p>
+  </section>
+
+  <section class="panel panel-tokens" aria-label="Token usage by provider">
+    <div class="panel-head">
+      <h2>token usage · by provider</h2>
+      <span class="panel-meta" id="tokens-total"></span>
+    </div>
+    <ul class="token-list" id="token-list"></ul>
+    <p class="empty" id="tokens-empty">no traffic in this window</p>
+  </section>
+
+  <section class="panel panel-retries" aria-label="Recent retries">
+    <div class="panel-head">
+      <h2>recent retries</h2>
+      <span class="panel-meta" title="Loom attaches router failover to the result dict rather than logging it, so a consumer-side handler cannot see it.">retries only</span>
+    </div>
+    <ul class="retry-list" id="retry-list"></ul>
+    <p class="empty" id="retries-empty">no retries in this window</p>
+  </section>
+
+  <section class="panel panel-play" aria-label="Playground">
+    <div class="panel-head">
+      <h2>playground · real call</h2>
+      <span class="panel-meta" id="play-meta">tagged source=playground</span>
+    </div>
+    <div class="play-grid">
+      <form class="play-form" id="play-form">
+        <label class="field">
+          <span>prompt</span>
+          <textarea id="play-prompt" rows="3"
+                    placeholder="Say hello in five words."></textarea>
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>provider</span>
+            <select id="play-provider"></select>
+          </label>
+          <label class="field">
+            <span>model</span>
+            <select id="play-model"></select>
+          </label>
+        </div>
+        <button type="submit" class="run" id="play-run">run</button>
+      </form>
+      <div class="play-out">
+        <pre id="play-output" class="play-output">No call yet. This fires a real <code>loom.generate()</code> with your keys — real provider, real latency, real cost — and it lands in the log below like any other call.</pre>
+        <p class="play-stats" id="play-stats"></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel panel-log" aria-label="Live request log">
+    <div class="panel-head">
+      <h2>live request log · structured</h2>
+      <span class="panel-meta" id="log-meta">tailing 1.3s</span>
+    </div>
+    <div class="log-wrap">
+      <table class="log">
+        <thead>
+          <tr>
+            <th scope="col">time</th>
+            <th scope="col">status</th>
+            <th scope="col">provider</th>
+            <th scope="col">model</th>
+            <th scope="col" class="num">latency</th>
+            <th scope="col">flags</th>
+            <th scope="col" class="num">tokens</th>
+            <th scope="col" class="num">cost</th>
+            <th scope="col">source</th>
+          </tr>
+        </thead>
+        <tbody id="log-body"></tbody>
+      </table>
+      <p class="empty" id="log-empty">waiting for calls…</p>
+    </div>
+  </section>
+
+</main>
+
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

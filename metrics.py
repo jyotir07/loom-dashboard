@@ -322,6 +322,33 @@ def cost_saved_estimate(
     }
 
 
+def recent_retries(
+    sink: EventSink, *, limit: int = 8, window_seconds: int | None = None
+) -> list[dict[str, Any]]:
+    """Calls that took more than one attempt, newest first.
+
+    Its own query rather than a filter over `tail()`: the last retry may be
+    hundreds of rows back, and a panel that goes blank because the log moved on
+    is worse than no panel.
+
+    This is the failover panel from the design doc, narrowed. Loom's router
+    attaches its decision trace to the returned result dict rather than logging
+    it, so no consumer-side handler can observe a failover. `retries` is a real
+    recorded column, so that's what this reports.
+    """
+    where, params = _window(window_seconds)
+    return sink.fetch(
+        sql=f"""
+            SELECT id, ts, provider, model, retries, ok, error_type
+            FROM loom_events
+            WHERE {where} AND retries > 0
+            ORDER BY id DESC
+            LIMIT ?
+        """,
+        params=(*params, int(limit)),
+    )
+
+
 def tail(
     sink: EventSink, *, limit: int = 50, after_id: int | None = None
 ) -> list[dict[str, Any]]:

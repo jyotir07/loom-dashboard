@@ -281,6 +281,46 @@ def test_cost_saved_ignores_calls_outside_window(sink):
     assert saved["usd"] == pytest.approx(0.25)
 
 
+# --- recent retries ---------------------------------------------------------
+
+def test_recent_retries_only_returns_retried_calls(sink):
+    write(sink, provider="openai", retries=0)
+    write(sink, provider="openai", retries=2, ok=False, error_type="RateLimitError")
+    write(sink, provider="xai", retries=1)
+
+    rows = metrics.recent_retries(sink)
+    assert [r["provider"] for r in rows] == ["xai", "openai"]
+    assert rows[1]["retries"] == 2
+    assert rows[1]["error_type"] == "RateLimitError"
+
+
+def test_recent_retries_reaches_past_the_log_tail(sink):
+    # The panel must not go blank just because the log moved on.
+    write(sink, provider="openai", retries=3)
+    for _ in range(200):
+        write(sink, provider="openai", retries=0)
+
+    assert metrics.tail(sink, limit=50) and all(
+        r["retries"] == 0 for r in metrics.tail(sink, limit=50)
+    )
+    assert metrics.recent_retries(sink)[0]["retries"] == 3
+
+
+def test_recent_retries_respects_window_and_limit(sink):
+    now = time.time()
+    write(sink, ts=now - 7200, retries=9)
+    for _ in range(5):
+        write(sink, ts=now, retries=1)
+
+    rows = metrics.recent_retries(sink, window_seconds=3600, limit=3)
+    assert len(rows) == 3
+    assert all(r["retries"] == 1 for r in rows)
+
+
+def test_recent_retries_empty_database(sink):
+    assert metrics.recent_retries(sink) == []
+
+
 # --- tail -------------------------------------------------------------------
 
 def test_tail_is_newest_first_and_carries_id(sink):

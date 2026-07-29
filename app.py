@@ -13,6 +13,7 @@ import logging
 import os
 import time
 
+import loom
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from loom.observability import LoomLogHandler, SQLiteSink
@@ -25,6 +26,19 @@ load_dotenv()
 
 DEFAULT_WINDOW = "24h"
 CHART_BUCKETS = 60
+
+# Loom resolves vendor keys as <PROVIDER>_API_KEY at call time; these are the
+# providers whose env var doesn't follow from the catalog name.
+_KEY_ENV_OVERRIDES = {
+    "zhipu": "ZAI_API_KEY",
+    "kimi": "MOONSHOT_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "seedream": "ARK_API_KEY",
+}
+
+
+def _key_env(provider: str) -> str:
+    return _KEY_ENV_OVERRIDES.get(provider, f"{provider.upper()}_API_KEY")
 
 
 def _install_capture(db_path: str) -> SQLiteSink:
@@ -40,6 +54,12 @@ def _install_capture(db_path: str) -> SQLiteSink:
     """
     sink = SQLiteSink(db_path)
     logger = logging.getLogger("loom")
+
+    # The `loom` logger is global, so a second create_app() in the same process
+    # would otherwise stack handlers and write every call once per sink.
+    for handler in [h for h in logger.handlers if isinstance(h, LoomLogHandler)]:
+        logger.removeHandler(handler)
+
     logger.setLevel(logging.INFO)
     logger.addHandler(LoomLogHandler(sink))
     logger.propagate = False
@@ -103,6 +123,7 @@ def create_app(db_path: str | None = None) -> Flask:
             ),
             "providers": metrics.provider_health(sink, window_seconds=window),
             "tokens": metrics.tokens_by_provider(sink, window_seconds=window),
+            "retries": metrics.recent_retries(sink, window_seconds=window),
             "demo_running": app.config["DEMO"].running,
         })
 
@@ -143,12 +164,104 @@ def create_app(db_path: str | None = None) -> Flask:
             )
         )
 
+    @app.get("/api/metrics/retries")
+    def metrics_retries():
+        limit = max(1, min(request.args.get("n", 8, type=int), 100))
+        return jsonify(metrics.recent_retries(
+            app.config["SINK"], limit=limit, window_seconds=_window_seconds()
+        ))
+
     @app.get("/api/logs/tail")
     def logs_tail():
         limit = max(1, min(request.args.get("n", 50, type=int), 500))
         after_id = request.args.get("after_id", type=int)
         rows = metrics.tail(app.config["SINK"], limit=limit, after_id=after_id)
         return jsonify({"events": rows})
+
+    # --- demo traffic ---------------------------------------------------
+
+    @app.post("/api/demo/start")
+    def demo_start():
+        started = app.config["DEMO"].start()
+        return jsonify({"running": True, "changed": started})
+
+    @app.post("/api/demo/stop")
+    def demo_stop():
+        stopped = app.config["DEMO"].stop()
+        return jsonify({"running": False, "changed": stopped})
+
+    # --- playground -----------------------------------------------------
+
+    def _client() -> loom.Loom:
+        """One lazily-built client, reused. Building it reads .env, so it is
+        deferred until someone actually makes a call — the dashboard must run
+        with no keys at all."""
+        if "LOOM" not in app.config:
+            app.config["LOOM"] = loom.Loom.from_env()
+        return app.config["LOOM"]
+
+    @app.get("/api/playground/models")
+    def playground_models():
+        """Only providers whose key is actually present.
+
+        Offering a model we have no credentials for just buys the user a 401
+        with extra steps.
+        """
+        catalog = _client().catalog
+        out = []
+        for provider in catalog.providers():
+            if not os.getenv(_key_env(provider)):
+                continue
+            models = [m["id"] for m in catalog.models(provider, "text") if m.get("id")]
+            if models:
+                out.append({"provider": provider, "models": sorted(models)})
+        return jsonify({"providers": out})
+
+    @app.post("/api/playground")
+    def playground():
+        """Fire a real generate() and let the normal handler path record it.
+
+        Nothing here writes to the sink: the call is logged by Loom, captured
+        by LoomLogHandler, and shows up in the dashboard like any other call.
+        The `playground` tag is what distinguishes it from demo rows.
+        """
+        body = request.get_json(silent=True) or {}
+        prompt = (body.get("prompt") or "").strip()
+        if not prompt:
+            return jsonify({"error": "prompt is required"}), 400
+
+        provider = body.get("provider") or None
+        model = body.get("model") or None
+        if provider and not os.getenv(_key_env(provider)):
+            return jsonify({
+                "error": f"no API key for {provider} — set {_key_env(provider)}"
+            }), 400
+
+        started = time.time()
+        try:
+            result = _client().generate(
+                prompt=prompt,
+                provider=provider,
+                model=model,
+                tags={"source": "playground"},
+            )
+        except Exception as exc:
+            # Loom has already logged the failure with its structured payload,
+            # so it lands in the log panel too. Report it rather than 500ing.
+            return jsonify({
+                "error": f"{type(exc).__name__}: {exc}",
+                "elapsed_ms": round((time.time() - started) * 1000, 1),
+            }), 502
+
+        return jsonify({
+            "text": result.get("text"),
+            "provider": result.get("provider"),
+            "model": result.get("model"),
+            "upstream_model": result.get("upstream_model"),
+            "usage": result.get("usage"),
+            "cost": result.get("cost"),
+            "elapsed_ms": round((time.time() - started) * 1000, 1),
+        })
 
     return app
 

@@ -33,18 +33,26 @@ instrumentation.
 
 ## Status
 
-**Nothing is built yet.** This README describes the design agreed in
-[`obser_db.md`](obser_db.md); the code lands stage by stage. Commands below work from the
-stage that introduces them.
+All four stages are built. `pytest` covers the aggregation layer (30 tests); every route
+has been exercised against seeded, empty, and error-heavy databases.
 
 | Stage | Scope | State |
 | ----- | ----- | ----- |
-| 1 | Capture wiring, `metrics.py` aggregations, synthetic traffic, tests | not started |
-| 2 | Flask app + JSON endpoints | not started |
-| 3 | Dashboard UI — template, CSS, SVG charts | not started |
-| 4 | Playground (real Loom calls) + demo-mode toggle | not started |
+| 1 | Capture wiring, `metrics.py` aggregations, synthetic traffic, tests | done |
+| 2 | Flask app + JSON endpoints | done |
+| 3 | Dashboard UI — template, CSS, SVG charts | done |
+| 4 | Playground (real Loom calls) + demo-mode toggle | done |
 
-Each stage is independently runnable. Stage 1 is verifiable from a CLI with no web layer.
+Each stage is independently runnable. Stage 1 is verifiable from a CLI with no web layer:
+
+```bash
+python traffic.py seed --count 500     # write synthetic events
+python traffic.py show --window 3600   # print every aggregation as JSON
+```
+
+**One thing is unverified:** the playground has never been run against a live provider,
+because this checkout has no API keys. Every other path is tested. Add a key to `.env` and
+fire one call to close that gap.
 
 ---
 
@@ -144,34 +152,50 @@ All routes are read-only and accept `?window=1h|24h|7d|30d|all` (default `24h`),
 | `GET /api/metrics/providers` | per-provider latency, error rate, health status |
 | `GET /api/metrics/timeseries` | per-minute request counts for the throughput chart |
 | `GET /api/metrics/tokens` | token usage by provider |
+| `GET /api/metrics/retries?n=8` | recent calls that took more than one attempt |
 | `GET /api/logs/tail?n=50&after_id=` | recent events for the live log |
+
+Three routes mutate, and are the only ones that do:
+
+| Route | Does |
+| ----- | ---- |
+| `POST /api/demo/start` · `/api/demo/stop` | control the synthetic generator |
+| `POST /api/playground` | fire one real `loom.generate()` and return the response |
+| `GET /api/playground/models` | providers with a key present, and their text models |
 
 The individual metric routes exist to keep the API browsable and `curl`-verifiable. The
 frontend uses `/api/snapshot` instead: one request every 2s rather than four, and all
 panels reflect the same instant rather than four staggered reads. The log tail polls
 separately at 1.3s and sends only rows newer than `after_id`.
 
-There is no auth. This binds to `127.0.0.1` and every route is read-only. If you expose it,
-put it behind your own login — the endpoints will happily report your spend to anyone who
-can reach them.
+There is no auth. This binds to `127.0.0.1`. If you expose it, put it behind your own
+login: the read routes will happily report your spend to anyone who can reach them, and
+`POST /api/playground` spends real money on your keys.
 
 ---
 
 ## Two honest caveats
 
-### "Cost saved" is an estimate
+### "Cost saved" is close to exact, but still an estimate
 
-Loom records *actual* cost per call. Saved means
-`cost_without_optimization − cost_with_optimization`, and the avoided figure is not
-recorded anywhere — a cache hit costs nothing and logs nothing about what it dodged.
+The design doc assumed the avoided cost isn't recorded anywhere. It very nearly is. Loom
+puts the *enriched* result into the cache (`_loom.py:417`), and a cache hit logs that same
+dict — so a cached row carries the exact `cost_usd` of the upstream call it replaced. Dedup
+waiters get the same enriched result. The card sums those recorded costs rather than
+inferring from an average.
 
-The card estimates it: for each cached or deduped event, the average cost of non-cached
-calls **of that same model**. Per-model rather than one blended average, because a cached
-`gpt-4o` hit and a cached `gpt-4o-mini` hit are worth very different amounts. It is
-labelled as an estimate in the UI and exposes its basis on hover.
+The per-model average is the fallback, used only for rows with no recorded cost (an
+unpriced model, a failure). Per-model rather than one blended average, because a cached
+`gpt-4o` hit and a cached `gpt-4o-mini` hit are worth very different amounts. The card
+reports which paths it actually used — hover the `est` badge.
 
-Making it exact means adding a `cost_saved_usd` field to Loom's `log_call` — an upstream
-change, out of scope for a standalone app.
+It stays labelled an estimate because "what you would have paid" is counterfactual: it
+assumes the call would have been made, at that model, at that price. A `cost_saved_usd`
+field on Loom's `log_call` would settle it, and that's an upstream change.
+
+One consequence worth knowing: because cached rows carry the original call's price,
+`SUM(cost_usd)` over all events **overstates** real spend. Actual spend is the sum over
+rows where `cached = 0 AND deduped = 0`.
 
 ### Failover isn't shown
 
@@ -187,12 +211,19 @@ it.
 ```
 app.py                     Flask app, startup wiring, routes
 metrics.py                 aggregations beyond loom.observability.queries
-traffic.py                 synthetic demo generator + real-call driver
+traffic.py                 synthetic demo generator + seed/show CLI
 templates/dashboard.html
 static/dashboard.css
 static/dashboard.js
+tests/test_metrics.py      aggregations vs hand-computed values
+requirements.txt           pins Loom to ../Loom/dist/*.whl
+.env.example               provider keys, DEMO_MODE, PORT
 obser_db.md                the design doc this implements
 ```
+
+Colors come from the `dataviz` skill's reference palette, dark column, validated against
+this surface (`#1a1a19`). The typeface is the one deliberate substitution — that palette
+parameterizes a UI sans, and the brief here is a monospace terminal.
 
 ---
 
